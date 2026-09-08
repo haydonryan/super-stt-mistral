@@ -198,10 +198,62 @@ pub fn error_json(msg: &str) -> String {
     json!({ "type": "error", "message": msg }).to_string()
 }
 
+/// What one upstream event from Mistral's realtime API means to the session.
+///
+/// Pure classification, kept here rather than in the wasm-only bridge so the
+/// protocol reading is unit-tested on the host. The bridge decides what to
+/// send the consumer; this only says what arrived.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UpstreamEvent {
+    /// An incremental transcript fragment to append and preview.
+    Delta(String),
+    /// The transcript is complete. Carries the upstream's own final text when
+    /// it sent one, otherwise the session falls back to what it accumulated.
+    Done(Option<String>),
+    /// The upstream reported a failure, with the best message it gave.
+    Error(String),
+    /// Handshake chatter, an unknown event type, or a frame that is not JSON.
+    /// Mistral may add event types, and an older backend must keep working, so
+    /// anything unrecognized is skipped rather than treated as a failure.
+    Ignore,
+}
+
+/// Classify one upstream JSON event.
+#[must_use]
+pub fn classify_upstream_event(s: &str) -> UpstreamEvent {
+    let Ok(v) = serde_json::from_str::<Value>(s) else {
+        return UpstreamEvent::Ignore;
+    };
+    match v.get("type").and_then(Value::as_str).unwrap_or("") {
+        "error" => {
+            let msg = v
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .or_else(|| v.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("upstream error");
+            UpstreamEvent::Error(msg.to_string())
+        }
+        "transcription.done" => {
+            UpstreamEvent::Done(v.get("text").and_then(Value::as_str).map(str::to_string))
+        }
+        // A delta carrying no text says nothing to append, so it is skipped
+        // rather than emitting a preview identical to the last one.
+        "transcription.text.delta" => v
+            .get("text")
+            .and_then(Value::as_str)
+            .map_or(UpstreamEvent::Ignore, |t| {
+                UpstreamEvent::Delta(t.to_string())
+            }),
+        _ => UpstreamEvent::Ignore,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        build_multipart, encode_wav, is_stop, parse_base, parse_start, parse_transcript, ws_url,
+        UpstreamEvent, build_multipart, classify_upstream_event, encode_wav, is_stop, parse_base,
+        parse_start, parse_transcript, ws_url,
     };
 
     #[test]
@@ -299,5 +351,68 @@ mod tests {
         assert!(is_stop(r#"{"type":"stop"}"#));
         assert!(!is_stop(r#"{"type":"start"}"#));
         assert!(!is_stop("garbage"));
+    }
+
+    /// The four events the bridge acts on, in the spellings Mistral actually
+    /// sends. Getting these wrong is what the realtime protocol fix was for,
+    /// so they are pinned here rather than only exercised through a mock.
+    #[test]
+    fn upstream_events_classify_by_type() {
+        assert_eq!(
+            classify_upstream_event(r#"{"type":"transcription.text.delta","text":"hello "}"#),
+            UpstreamEvent::Delta("hello ".to_string())
+        );
+        assert_eq!(
+            classify_upstream_event(r#"{"type":"transcription.done","text":"hello world"}"#),
+            UpstreamEvent::Done(Some("hello world".to_string()))
+        );
+        assert_eq!(
+            classify_upstream_event(r#"{"type":"transcription.done"}"#),
+            UpstreamEvent::Done(None),
+            "no final text means fall back to what was accumulated"
+        );
+        assert_eq!(
+            classify_upstream_event(r#"{"type":"session.created"}"#),
+            UpstreamEvent::Ignore,
+            "the handshake is read before the session loop"
+        );
+    }
+
+    /// An error may name its message at the top level or nested under `error`,
+    /// and must still be an error when it names neither.
+    #[test]
+    fn upstream_errors_surface_the_best_message_available() {
+        assert_eq!(
+            classify_upstream_event(r#"{"type":"error","error":{"message":"bad key"}}"#),
+            UpstreamEvent::Error("bad key".to_string())
+        );
+        assert_eq!(
+            classify_upstream_event(r#"{"type":"error","message":"rate limited"}"#),
+            UpstreamEvent::Error("rate limited".to_string())
+        );
+        assert_eq!(
+            classify_upstream_event(r#"{"type":"error"}"#),
+            UpstreamEvent::Error("upstream error".to_string())
+        );
+    }
+
+    /// Mistral may add event types, and a frame may not be JSON at all. Either
+    /// way the session keeps going: treating the unknown as terminal would end
+    /// a working transcription.
+    #[test]
+    fn unknown_and_malformed_events_are_skipped() {
+        for raw in [
+            r#"{"type":"transcription.text.delta"}"#,
+            r#"{"type":"something.new"}"#,
+            r#"{"no_type":true}"#,
+            "not json at all",
+            "",
+        ] {
+            assert_eq!(
+                classify_upstream_event(raw),
+                UpstreamEvent::Ignore,
+                "should be ignored: {raw}"
+            );
+        }
     }
 }

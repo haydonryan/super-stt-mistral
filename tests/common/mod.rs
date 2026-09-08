@@ -216,6 +216,71 @@ fn is_disallowed_v4(v4: Ipv4Addr) -> bool {
 /// A live outgoing WebSocket owned by the host. `None` once closed.
 pub struct WsStreamResource {
     stream: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    /// One-frame lookahead. `wasi:io/poll` asks "is this readable?" without
+    /// taking anything, but a `WebSocketStream` only answers by consuming, so
+    /// [`Pollable::ready`] reads one frame and parks it here for the `recv`
+    /// that follows. Readiness stays non-destructive from the guest's side:
+    /// every frame `ready` observes is still delivered by `recv`.
+    pending: Option<std::result::Result<WsFrame, WsError>>,
+}
+
+impl WsStreamResource {
+    fn new(stream: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
+        Self {
+            stream: Some(stream),
+            pending: None,
+        }
+    }
+
+    /// The next frame the protocol exposes, skipping tungstenite's ping/pong.
+    ///
+    /// Cancel-safe, which `poll` requires: it races both `ready` futures and
+    /// drops the loser.
+    async fn next_frame(&mut self) -> std::result::Result<WsFrame, WsError> {
+        let Some(stream) = self.stream.as_mut() else {
+            return Err(WsError::Closed);
+        };
+        loop {
+            match stream.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    return Ok(WsFrame::Text(text.as_str().to_string()));
+                }
+                Some(Ok(Message::Binary(data))) => return Ok(WsFrame::Binary(data.into())),
+                Some(Ok(Message::Close(frame))) => {
+                    self.stream = None;
+                    let close = frame.map_or(
+                        CloseFrame {
+                            code: 1005,
+                            reason: String::new(),
+                        },
+                        |f| CloseFrame {
+                            code: f.code.into(),
+                            reason: f.reason.as_str().to_string(),
+                        },
+                    );
+                    return Ok(WsFrame::Close(close));
+                }
+                Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
+                Some(Err(e)) => {
+                    self.stream = None;
+                    return Err(WsError::RecvFailed(format!("recv failed: {e}")));
+                }
+                None => {
+                    self.stream = None;
+                    return Err(WsError::Closed);
+                }
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl wasmtime_wasi::p2::Pollable for WsStreamResource {
+    async fn ready(&mut self) {
+        if self.pending.is_none() {
+            self.pending = Some(self.next_frame().await);
+        }
+    }
 }
 
 /// The host-side bridge between the test's consumer channels and the guest's
@@ -232,6 +297,41 @@ pub struct ConsumerStreamTransport {
 /// `ws-server.handle`. `None` once the session is closed.
 pub struct ConsumerStreamResource {
     transport: Option<ConsumerStreamTransport>,
+    /// One-frame lookahead, for the same reason as [`WsStreamResource::pending`].
+    pending: Option<std::result::Result<WsFrame, WsError>>,
+}
+
+impl ConsumerStreamResource {
+    /// Wrap a live transport for handoff to the guest.
+    pub fn new(t: ConsumerStreamTransport) -> Self {
+        Self {
+            transport: Some(t),
+            pending: None,
+        }
+    }
+
+    /// The next frame from the consumer, or `Closed` once the test drops its
+    /// sender. Cancel-safe: `mpsc::Receiver::recv` leaves the queue untouched
+    /// when its future is dropped before completing.
+    async fn next_frame(&mut self) -> std::result::Result<WsFrame, WsError> {
+        let Some(transport) = self.transport.as_mut() else {
+            return Err(WsError::Closed);
+        };
+        let Some(frame) = transport.incoming.recv().await else {
+            self.transport = None;
+            return Err(WsError::Closed);
+        };
+        Ok(frame)
+    }
+}
+
+#[async_trait::async_trait]
+impl wasmtime_wasi::p2::Pollable for ConsumerStreamResource {
+    async fn ready(&mut self) {
+        if self.pending.is_none() {
+            self.pending = Some(self.next_frame().await);
+        }
+    }
 }
 
 /// WebSocket handshake headers the host owns; a guest-supplied header with one
@@ -313,9 +413,7 @@ impl self::super_stt::realtime::ws::Host for Host {
 
         match connect_async(request).await {
             Ok((stream, _response)) => {
-                let resource = self.table.push(WsStreamResource {
-                    stream: Some(stream),
-                })?;
+                let resource = self.table.push(WsStreamResource::new(stream))?;
                 Ok(Ok(resource))
             }
             Err(e) => Ok(Err(WsError::ConnectFailed(format!("connect failed: {e}")))),
@@ -323,6 +421,10 @@ impl self::super_stt::realtime::ws::Host for Host {
     }
 }
 
+// Signatures here are dictated by wasmtime's generated trait, so the `async`
+// cannot be dropped from the members that never await. `unknown_lints` keeps
+// the attribute harmless on toolchains predating the lint.
+#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 impl self::super_stt::realtime::ws::HostWsStream for Host {
     async fn send_text(
         &mut self,
@@ -359,49 +461,23 @@ impl self::super_stt::realtime::ws::HostWsStream for Host {
         self_: Resource<WsStreamResource>,
     ) -> wasmtime::Result<std::result::Result<WsFrame, WsError>> {
         let res = self.table.get_mut(&self_)?;
-        let Some(stream) = res.stream.as_mut() else {
-            return Ok(Err(WsError::Closed));
-        };
-        loop {
-            match stream.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    return Ok(Ok(WsFrame::Text(text.as_str().to_string())));
-                }
-                Some(Ok(Message::Binary(data))) => {
-                    return Ok(Ok(WsFrame::Binary(data.into())));
-                }
-                Some(Ok(Message::Close(frame))) => {
-                    res.stream = None;
-                    let close = frame.map_or(
-                        CloseFrame {
-                            code: 1005,
-                            reason: String::new(),
-                        },
-                        |f| CloseFrame {
-                            code: f.code.into(),
-                            reason: f.reason.as_str().to_string(),
-                        },
-                    );
-                    return Ok(Ok(WsFrame::Close(close)));
-                }
-                Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
-                Some(Err(e)) => {
-                    res.stream = None;
-                    return Ok(Err(WsError::RecvFailed(format!("recv failed: {e}"))));
-                }
-                None => {
-                    res.stream = None;
-                    return Ok(Err(WsError::Closed));
-                }
-            }
+        // A frame `subscribe`/`ready` already pulled off the socket is handed
+        // over before touching the stream again.
+        if let Some(frame) = res.pending.take() {
+            return Ok(frame);
         }
+        Ok(res.next_frame().await)
     }
 
     async fn subscribe(
         &mut self,
-        _self_: Resource<WsStreamResource>,
+        self_: Resource<WsStreamResource>,
     ) -> wasmtime::Result<Resource<wasmtime_wasi::p2::bindings::io::poll::Pollable>> {
-        wasmtime::bail!("ws-stream::subscribe is not yet implemented")
+        // Backed by the one-frame lookahead, exactly as the daemon's host does
+        // it: the pollable resolves once a frame has been read, and `recv`
+        // hands that same frame over. This is what lets the guest wait on its
+        // consumer and its upstream at once.
+        wasmtime_wasi::p2::subscribe(&mut self.table, self_)
     }
 
     async fn close(
@@ -421,6 +497,10 @@ impl self::super_stt::realtime::ws::HostWsStream for Host {
     }
 }
 
+// Signatures here are dictated by wasmtime's generated trait, so the `async`
+// cannot be dropped from the members that never await. `unknown_lints` keeps
+// the attribute harmless on toolchains predating the lint.
+#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 impl self::super_stt::realtime::ws::HostConsumerStream for Host {
     async fn send_text(
         &mut self,
@@ -457,22 +537,20 @@ impl self::super_stt::realtime::ws::HostConsumerStream for Host {
         self_: Resource<ConsumerStreamResource>,
     ) -> wasmtime::Result<std::result::Result<WsFrame, WsError>> {
         let res = self.table.get_mut(&self_)?;
-        let Some(transport) = res.transport.as_mut() else {
-            return Ok(Err(WsError::Closed));
-        };
-        if let Some(frame) = transport.incoming.recv().await {
-            Ok(Ok(frame))
-        } else {
-            res.transport = None;
-            Ok(Err(WsError::Closed))
+        // A frame `subscribe`/`ready` already took off the channel is handed
+        // over before waiting on it again.
+        if let Some(frame) = res.pending.take() {
+            return Ok(frame);
         }
+        Ok(res.next_frame().await)
     }
 
     async fn subscribe(
         &mut self,
-        _self_: Resource<ConsumerStreamResource>,
+        self_: Resource<ConsumerStreamResource>,
     ) -> wasmtime::Result<Resource<wasmtime_wasi::p2::bindings::io::poll::Pollable>> {
-        wasmtime::bail!("consumer-stream::subscribe is not yet implemented")
+        // Backed by the same one-frame lookahead as `ws-stream::subscribe`.
+        wasmtime_wasi::p2::subscribe(&mut self.table, self_)
     }
 
     async fn close(
@@ -692,9 +770,10 @@ impl WasmBackend {
             "x-stt-model".to_string(),
             self.model_id.clone().into_bytes(),
         ));
-        let consumer = store.data_mut().table.push(ConsumerStreamResource {
-            transport: Some(transport),
-        })?;
+        let consumer = store
+            .data_mut()
+            .table
+            .push(ConsumerStreamResource::new(transport))?;
         let inst = self.pre.instantiate_async(&mut store).await?;
         inst.super_stt_realtime_ws_server()
             .call_handle(&mut store, &headers, consumer)
