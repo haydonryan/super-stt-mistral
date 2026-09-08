@@ -37,7 +37,7 @@
     default-features = false,
     features         = ["connect", "rustls-tls-webpki-roots"]
   }
-  wasmtime           = { version = "45", features = ["async"] }
-  wasmtime-wasi      = "45"
-  wasmtime-wasi-http = "45"
+  wasmtime           = { version = "46", features = ["async"] }
+  wasmtime-wasi      = "46"
+  wasmtime-wasi-http = "46"
   wiremock           = "0.6.5"
