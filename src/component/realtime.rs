@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Mistral realtime WebSocket transcription bridge.
 //!
-//! Bridges a consumer WebSocket session to Mistral's realtime transcription
-//! API (`wss://api.mistral.ai/v1/audio/transcriptions/realtime`).
+//! Bridges a consumer WebSocket session to the realtime transcription
+//! endpoint named by `base_url` (`/v1/realtime?model=…`), which defaults to
+//! Mistral's. It speaks the vLLM realtime protocol (`session.update` with a
+//! top-level `model`, then `input_audio_buffer.append`/`commit`, reading
+//! `transcription.delta`/`transcription.done` upstream) — the wire format
+//! Mistral's hosted realtime API and vLLM's `/v1/realtime` both serve.
 //!
 //! ## Full duplex
 //! The session waits on the consumer and the upstream at the same time, via
@@ -40,8 +44,7 @@ const UPSTREAM: u32 = 1;
 
 const DEFAULT_BASE_URL: &str = "https://api.mistral.ai";
 const DEFAULT_MODEL: &str = "voxtral-mini-transcribe-realtime-2602";
-const INPUT_AUDIO_FLUSH: &str = r#"{"type":"input_audio.flush"}"#;
-const INPUT_AUDIO_END: &str = r#"{"type":"input_audio.end"}"#;
+const INPUT_AUDIO_BUFFER_COMMIT: &str = r#"{"type":"input_audio_buffer.commit"}"#;
 
 impl WsServerGuest for super::Component {
     fn handle(headers: Vec<(String, Vec<u8>)>, consumer: ConsumerStream) -> Result<(), WsError> {
@@ -54,12 +57,19 @@ fn run(headers: &[(String, Vec<u8>)], consumer: &ConsumerStream) -> Result<(), W
         let _ = consumer.send_text(&crate::error_json("missing mistral api key"));
         return Ok(());
     };
-    // Internal test seam: `base_url` is not a declared manifest option, so the
-    // daemon never sends this header in production — the default is always used.
-    // The realtime round-trip test injects it to reach a mock upstream.
+    // `base_url` is a declared manifest option, so the daemon sends it as
+    // `x-stt-option-base_url` when the user overrides it in Settings; otherwise
+    // the default upstream is used. The realtime round-trip test also injects it
+    // to reach a mock upstream.
     let base_url = crate::header(headers, "x-stt-option-base_url")
         .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-    let model = crate::header(headers, "x-stt-model").unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    // The selected model names the endpoint's `model` query param. A user-set
+    // `custom_model` option overrides it — the model the gateway actually serves
+    // can differ from the catalog name (e.g. the URL's `model=whisper-1`).
+    let selected = crate::header(headers, "x-stt-model").unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let model = crate::header(headers, "x-stt-option-custom_model")
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or(selected);
 
     // 1. Read and validate the consumer's `start` frame. Mistral needs no
     //    session config — the model is in the URL and PCM s16le/16 kHz is
@@ -95,6 +105,14 @@ fn run(headers: &[(String, Vec<u8>)], consumer: &ConsumerStream) -> Result<(), W
         }
     };
     if !await_session_created(&upstream, consumer) {
+        return Ok(());
+    }
+    // Name the model for the upstream before any audio flows: vLLM refuses
+    // `input_audio_buffer.*` frames until `session.update` has set the model.
+    if let Err(e) = upstream.send_text(&crate::session_update_json(&model)) {
+        let _ = consumer.send_text(&crate::error_json(&format!(
+            "session.update failed: {e:?}"
+        )));
         return Ok(());
     }
 
@@ -172,14 +190,13 @@ fn forward_consumer_frame(consumer: &ConsumerStream, upstream: &WsStream) -> Inp
     }
 }
 
-/// Tell the upstream no more audio is coming. Returns `false` (after notifying
-/// the consumer) when the upstream could not be written to.
+/// Tell the upstream no more audio is coming and to transcribe what it has.
+/// Returns `false` (after notifying the consumer) when the upstream could not
+/// be written to.
 fn end_input(upstream: &WsStream, consumer: &ConsumerStream) -> bool {
-    for msg in [INPUT_AUDIO_FLUSH, INPUT_AUDIO_END] {
-        if let Err(e) = upstream.send_text(msg) {
-            let _ = consumer.send_text(&crate::error_json(&format!("flush/end failed: {e:?}")));
-            return false;
-        }
+    if let Err(e) = upstream.send_text(INPUT_AUDIO_BUFFER_COMMIT) {
+        let _ = consumer.send_text(&crate::error_json(&format!("commit failed: {e:?}")));
+        return false;
     }
     true
 }

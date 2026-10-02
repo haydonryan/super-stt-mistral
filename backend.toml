@@ -6,7 +6,7 @@
   id          = "app.super-stt.mistral"
   source      = "github.com/jorge-menjivar/super-stt-mistral"
   name        = "Mistral"
-  version     = "0.1.1"
+  version     = "0.1.3"
   kind        = "wasm"
   entrypoint  = "mistral.wasm"
   contract    = "v2"
@@ -27,6 +27,18 @@
   label       = "Mistral API key"
   description = "Used to authenticate requests to api.mistral.ai."
   required    = true
+
+[[options]]
+  name        = "base_url"
+  label       = "API base URL"
+  description = "Override the API base URL, e.g. for a proxy or gateway. Give the scheme and host, e.g. https://gateway.example.com — the /v1/realtime path is appended for realtime and /v1/audio/transcriptions for batch. The host you set here is automatically authorized for network egress. A local endpoint needs an explicit http:// scheme (a value without one is read as https) and its port; only that exact port is authorized."
+  type        = "string"
+
+[[options]]
+  name        = "custom_model"
+  label       = "Custom model name"
+  description = "Model name to send in the realtime URL's model query, e.g. when a gateway routes by name and serves a model under a different catalog name. Defaults to the selected model. Ignored for batch transcription."
+  type        = "string"
 
 [[models]]
   name                = "voxtral-mini-latest"

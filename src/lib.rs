@@ -137,15 +137,23 @@ pub fn ws_url(base_url: &str, model: &str) -> String {
         "wss"
     };
     let host = host.trim_end_matches('/');
-    format!("{scheme}://{host}/v1/audio/transcriptions/realtime?model={model}")
+    format!("{scheme}://{host}/v1/realtime?model={model}")
 }
 
-/// `input_audio.append` payload carrying base64-standard PCM (s16le mono 16 kHz,
-/// the format Mistral's realtime transcription expects).
+/// `input_audio_buffer.append` payload carrying base64-standard PCM (s16le mono
+/// 16 kHz, the format a vLLM realtime endpoint expects).
 #[must_use]
 pub fn audio_append_json(pcm: &[u8]) -> String {
     let audio = base64::engine::general_purpose::STANDARD.encode(pcm);
-    json!({ "type": "input_audio.append", "audio": audio }).to_string()
+    json!({ "type": "input_audio_buffer.append", "audio": audio }).to_string()
+}
+
+/// The `session.update` that names the model for a vLLM realtime session. vLLM
+/// reads the model as a top-level field and refuses audio frames until it has
+/// seen it, so this must be sent before any `input_audio_buffer.*` frame.
+#[must_use]
+pub fn session_update_json(model: &str) -> String {
+    json!({ "type": "session.update", "model": model }).to_string()
 }
 
 /// Parse the consumer's `start` frame: `{"type":"start","sample_rate":N,
@@ -238,7 +246,15 @@ pub fn classify_upstream_event(s: &str) -> UpstreamEvent {
             UpstreamEvent::Done(v.get("text").and_then(Value::as_str).map(str::to_string))
         }
         // A delta carrying no text says nothing to append, so it is skipped
-        // rather than emitting a preview identical to the last one.
+        // rather than emitting a preview identical to the last one. vLLM sends
+        // `transcription.delta` with a `delta` field (Mistral's older realtime
+        // API used `transcription.text.delta` with `text`); both are read.
+        "transcription.delta" => v
+            .get("delta")
+            .and_then(Value::as_str)
+            .map_or(UpstreamEvent::Ignore, |t| {
+                UpstreamEvent::Delta(t.to_string())
+            }),
         "transcription.text.delta" => v
             .get("text")
             .and_then(Value::as_str)
@@ -252,8 +268,8 @@ pub fn classify_upstream_event(s: &str) -> UpstreamEvent {
 #[cfg(test)]
 mod tests {
     use super::{
-        UpstreamEvent, build_multipart, classify_upstream_event, encode_wav, is_stop, parse_base,
-        parse_start, parse_transcript, ws_url,
+        UpstreamEvent, audio_append_json, build_multipart, classify_upstream_event, encode_wav,
+        is_stop, parse_base, parse_start, parse_transcript, session_update_json, ws_url,
     };
 
     #[test]
@@ -322,15 +338,15 @@ mod tests {
     fn ws_url_scheme_mapping() {
         assert_eq!(
             ws_url("https://api.mistral.ai", "m"),
-            "wss://api.mistral.ai/v1/audio/transcriptions/realtime?model=m"
+            "wss://api.mistral.ai/v1/realtime?model=m"
         );
         assert_eq!(
             ws_url("http://127.0.0.1:9/", "m"),
-            "ws://127.0.0.1:9/v1/audio/transcriptions/realtime?model=m"
+            "ws://127.0.0.1:9/v1/realtime?model=m"
         );
         assert_eq!(
             ws_url("api.mistral.ai", "m"),
-            "wss://api.mistral.ai/v1/audio/transcriptions/realtime?model=m"
+            "wss://api.mistral.ai/v1/realtime?model=m"
         );
     }
 
@@ -347,19 +363,32 @@ mod tests {
     }
 
     #[test]
+    fn realtime_frames_carry_the_right_types() {
+        assert_eq!(
+            audio_append_json(&[0u8, 1, 2][..]),
+            r#"{"audio":"AAEC","type":"input_audio_buffer.append"}"#
+        );
+        assert_eq!(
+            session_update_json("whisper-1"),
+            r#"{"model":"whisper-1","type":"session.update"}"#
+        );
+    }
+
+    #[test]
     fn is_stop_detects_stop_frames() {
         assert!(is_stop(r#"{"type":"stop"}"#));
         assert!(!is_stop(r#"{"type":"start"}"#));
         assert!(!is_stop("garbage"));
     }
 
-    /// The four events the bridge acts on, in the spellings Mistral actually
-    /// sends. Getting these wrong is what the realtime protocol fix was for,
-    /// so they are pinned here rather than only exercised through a mock.
+    /// The events the bridge acts on, in the spellings vLLM's realtime API
+    /// actually sends. Getting these wrong is what the realtime protocol fix
+    /// was for, so they are pinned here rather than only exercised through a
+    /// mock.
     #[test]
     fn upstream_events_classify_by_type() {
         assert_eq!(
-            classify_upstream_event(r#"{"type":"transcription.text.delta","text":"hello "}"#),
+            classify_upstream_event(r#"{"type":"transcription.delta","delta":"hello "}"#),
             UpstreamEvent::Delta("hello ".to_string())
         );
         assert_eq!(
