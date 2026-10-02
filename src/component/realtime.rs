@@ -45,6 +45,7 @@ const UPSTREAM: u32 = 1;
 const DEFAULT_BASE_URL: &str = "https://api.mistral.ai";
 const DEFAULT_MODEL: &str = "voxtral-mini-transcribe-realtime-2602";
 const INPUT_AUDIO_BUFFER_COMMIT: &str = r#"{"type":"input_audio_buffer.commit"}"#;
+const INPUT_AUDIO_BUFFER_COMMIT_FINAL: &str = r#"{"type":"input_audio_buffer.commit","final":true}"#;
 
 impl WsServerGuest for super::Component {
     fn handle(headers: Vec<(String, Vec<u8>)>, consumer: ConsumerStream) -> Result<(), WsError> {
@@ -191,12 +192,16 @@ fn forward_consumer_frame(consumer: &ConsumerStream, upstream: &WsStream) -> Inp
 }
 
 /// Tell the upstream no more audio is coming and to transcribe what it has.
+/// vLLM only emits the final `transcription.done` after a `final:true` commit,
+/// and a bare commit only starts generation, so both are sent in order.
 /// Returns `false` (after notifying the consumer) when the upstream could not
 /// be written to.
 fn end_input(upstream: &WsStream, consumer: &ConsumerStream) -> bool {
-    if let Err(e) = upstream.send_text(INPUT_AUDIO_BUFFER_COMMIT) {
-        let _ = consumer.send_text(&crate::error_json(&format!("commit failed: {e:?}")));
-        return false;
+    for msg in [INPUT_AUDIO_BUFFER_COMMIT, INPUT_AUDIO_BUFFER_COMMIT_FINAL] {
+        if let Err(e) = upstream.send_text(msg) {
+            let _ = consumer.send_text(&crate::error_json(&format!("commit failed: {e:?}")));
+            return false;
+        }
     }
     true
 }
